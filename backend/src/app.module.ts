@@ -101,6 +101,7 @@ const envValidationSchema = Joi.object({
 
   APM_SAMPLING_RATE: Joi.number().min(0).max(1).default(1.0).optional(),
   APM_ENABLED: Joi.boolean().default(true).optional(),
+  ALLOWED_ORIGINS: Joi.string().optional(),
 });
 
 @Module({
@@ -155,6 +156,30 @@ const envValidationSchema = Joi.object({
       useFactory: (configService: ConfigService) => {
         const dbUrl = configService.get<string>('database.url');
         const dbHost = configService.get<string>('database.host');
+        const isProduction = configService.get<string>('NODE_ENV') === 'production';
+        const redisUrl = configService.get<string>('REDIS_URL');
+
+        const poolConfig = {
+          max: configService.get<number>('DATABASE_POOL_MAX', isProduction ? 30 : 10),
+          min: configService.get<number>('DATABASE_POOL_MIN', isProduction ? 5 : 2),
+          idleTimeoutMillis: configService.get<number>('DATABASE_IDLE_TIMEOUT', 30000),
+          connectionTimeoutMillis: configService.get<number>('DATABASE_CONNECTION_TIMEOUT', 2000),
+          statement_timeout: 30000,
+          query_timeout: 30000,
+          validationQuery: 'SELECT 1',
+          validateConnection: true,
+        };
+
+        const cacheConfig = redisUrl
+          ? {
+              type: 'redis' as const,
+              options: { url: redisUrl },
+              duration: 30000,
+            }
+          : {
+              type: 'database' as const,
+              duration: 30000,
+            };
 
         if (dbUrl) {
           // URL-based connection (e.g. DATABASE_URL on cloud platforms)
@@ -163,6 +188,9 @@ const envValidationSchema = Joi.object({
             url: dbUrl,
             autoLoadEntities: true,
             synchronize: configService.get<string>('NODE_ENV') !== 'production',
+            extra: poolConfig,
+            cache: cacheConfig,
+            maxQueryExecutionTime: 100, // Monitor and log queries exceeding 100ms
           };
         }
 
@@ -182,6 +210,9 @@ const envValidationSchema = Joi.object({
           password: configService.get<string>('database.pass'),
           autoLoadEntities: true,
           synchronize: configService.get<string>('NODE_ENV') !== 'production',
+          extra: poolConfig,
+          cache: cacheConfig,
+          maxQueryExecutionTime: 100, // Monitor and log queries exceeding 100ms
         };
       },
     }),
