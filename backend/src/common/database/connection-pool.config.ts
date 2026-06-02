@@ -119,4 +119,20 @@ export class ConnectionPoolService {
 
     return 0;
   }
+
+  getPoolSummary() {
+    return {
+      averageUtilization: this.getAverageUtilization(),
+      latestMetrics: this.getLatestMetrics(),
+      totalCollected: this.metrics.length,
+    };
+  }
+
+  async getHealthStatus() {
+    const isHealthy = await this.checkPoolHealth();
+    return {
+      status: isHealthy ? 'healthy' : 'unhealthy',
+      timestamp: new Date(),
+    };
+  }
 }

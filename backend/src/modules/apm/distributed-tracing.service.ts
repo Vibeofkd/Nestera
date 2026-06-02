@@ -18,7 +18,11 @@ export interface Span {
   endTime?: number;
   duration?: number;
   tags: Record<string, string | number | boolean>;
-  logs: Array<{ timestamp: number; message: string; fields?: Record<string, unknown> }>;
+  logs: Array<{
+    timestamp: number;
+    message: string;
+    fields?: Record<string, unknown>;
+  }>;
   status: 'active' | 'completed' | 'error';
   error?: string;
 }
@@ -35,7 +39,9 @@ export class DistributedTracingService {
     this.samplingRate = parseFloat(process.env.APM_SAMPLING_RATE || '1.0');
   }
 
-  parseTraceContext(headers: Record<string, string | string[] | undefined>): TraceContext | null {
+  parseTraceContext(
+    headers: Record<string, string | string[] | undefined>,
+  ): TraceContext | null {
     // W3C Trace Context format: traceparent header
     const traceparent = headers['traceparent'] as string;
     if (traceparent) {
@@ -47,7 +53,8 @@ export class DistributedTracingService {
     if (ddTraceId) {
       return {
         traceId: ddTraceId,
-        spanId: (headers['x-datadog-parent-id'] as string) || this.generateSpanId(),
+        spanId:
+          (headers['x-datadog-parent-id'] as string) || this.generateSpanId(),
         sampled: (headers['x-datadog-sampling-priority'] as string) !== '0',
         baggage: {},
       };
@@ -140,8 +147,12 @@ export class DistributedTracingService {
 
     if (span.duration && span.duration > 1000) {
       this.logger.warn(
-        `Slow span detected: ${operationName} took ${span.duration}ms`,
-        { traceId: span.traceId, spanId: span.spanId, operationName: span.operationName },
+        `Slow span detected: ${span.operationName} took ${span.duration}ms`,
+        {
+          traceId: span.traceId,
+          spanId: span.spanId,
+          operationName: span.operationName,
+        },
       );
     }
   }
@@ -150,7 +161,11 @@ export class DistributedTracingService {
     span.tags[key] = value;
   }
 
-  addSpanLog(span: Span, message: string, fields?: Record<string, unknown>): void {
+  addSpanLog(
+    span: Span,
+    message: string,
+    fields?: Record<string, unknown>,
+  ): void {
     span.logs.push({ timestamp: Date.now(), message, fields });
   }
 
@@ -178,7 +193,9 @@ export class DistributedTracingService {
   getTracingStats() {
     const completed = this.completedSpans;
     const errorSpans = completed.filter((s) => s.status === 'error');
-    const durations = completed.map((s) => s.duration || 0).filter((d) => d > 0);
+    const durations = completed
+      .map((s) => s.duration || 0)
+      .filter((d) => d > 0);
     const sorted = [...durations].sort((a, b) => a - b);
 
     return {
