@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import {
+  INestApplication,
   ValidationPipe,
   VersioningType,
   BadRequestException,
@@ -16,6 +17,29 @@ import {
 import { VersionAnalyticsInterceptor } from './common/versioning/version-analytics.interceptor';
 import { VersionAnalyticsService } from './common/versioning/version-analytics.service';
 import { GracefulShutdownService } from './common/services/graceful-shutdown.service';
+
+async function flushApplicationLogs(
+  app: INestApplication,
+  logger: Logger,
+): Promise<void> {
+  const nestApp = app as INestApplication & {
+    flushLogs?: () => Promise<void> | void;
+  };
+
+  if (typeof nestApp.flushLogs === 'function') {
+    await nestApp.flushLogs();
+    return;
+  }
+
+  const pinoLogger = logger as Logger & {
+    flush?: () => void;
+    logger?: { flush?: () => void };
+  };
+
+  pinoLogger.flush?.();
+  pinoLogger.logger?.flush?.();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
@@ -160,8 +184,10 @@ The API supports URI-based versioning (\`/api/v1/...\` and \`/api/v2/...\`).
     res.redirect('/api/v2/docs');
   });
 
-  const server = await app.listen(port || 3001);
+  await app.listen(port || 3001);
   const logger = app.get(Logger);
+  const gracefulShutdown = app.get(GracefulShutdownService);
+  gracefulShutdown.registerHttpServer(app.getHttpServer());
   logger.log(`Application is running on: http://localhost:${port}/api`);
   logger.log(`Swagger docs (current):    http://localhost:${port}/api/docs`);
   logger.log(`Swagger v2 docs:           http://localhost:${port}/api/v2/docs`);
@@ -169,19 +195,20 @@ The API supports URI-based versioning (\`/api/v1/...\` and \`/api/v2/...\`).
     `Swagger v1 docs (deprecated): http://localhost:${port}/api/v1/docs`,
   );
 
-  // Setup graceful shutdown
-  const gracefulShutdown = app.get(GracefulShutdownService);
-
-  const signals = ['SIGTERM', 'SIGINT'];
-  signals.forEach((signal) => {
-    process.on(signal, async () => {
-      logger.log(`Received ${signal}, starting graceful shutdown...`);
-      server.close(async () => {
-        await app.close();
-        process.exit(0);
-      });
+  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
+  for (const signal of signals) {
+    process.once(signal, () => {
+      void gracefulShutdown
+        .shutdownApplication(
+          signal,
+          () => app.close(),
+          () => flushApplicationLogs(app, logger),
+        )
+        .then((exitCode) => {
+          process.exit(exitCode);
+        });
     });
-  });
+  }
 
   // Handle uncaught exceptions
   process.on('uncaughtException', (error) => {
