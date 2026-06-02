@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { BullModule } from '@nestjs/bull';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -49,6 +49,7 @@ import { PostmanModule } from './common/postman/postman.module';
 import { CorrelationIdMiddleware } from './common/middleware/correlation-id.middleware';
 import { JobsModule } from './modules/jobs/jobs.module';
 import { GracefulShutdownService } from './common/services/graceful-shutdown.service';
+import { PerformanceModule } from './modules/performance/performance.module';
 
 const envValidationSchema = Joi.object({
   NODE_ENV: Joi.string().valid('development', 'production', 'test').required(),
@@ -99,31 +100,7 @@ const envValidationSchema = Joi.object({
 
 @Module({
   imports: [
-    LoggerModule.forRootAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => {
-        const isProduction =
-          configService.get<string>('NODE_ENV') === 'production';
-        return {
-          pinoHttp: {
-            transport: isProduction
-              ? undefined
-              : { target: 'pino-pretty', options: { singleLine: true } },
-            level: isProduction ? 'info' : 'debug',
-          },
-        };
-      },
-    }),
-    BullModule.forRootAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        redis: {
-          uri: config.get<string>('REDIS_URL') || 'redis://localhost:6379',
-        },
-      }),
-    }),
+    ConfigModule.forRoot({
       isGlobal: true,
       load: [configuration],
       validationSchema: envValidationSchema,
@@ -149,6 +126,31 @@ const envValidationSchema = Joi.object({
 
         return value;
       },
+    }),
+    LoggerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => {
+        const isProduction =
+          configService.get<string>('NODE_ENV') === 'production';
+        return {
+          pinoHttp: {
+            transport: isProduction
+              ? undefined
+              : { target: 'pino-pretty', options: { singleLine: true } },
+            level: isProduction ? 'info' : 'debug',
+          },
+        };
+      },
+    }),
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        redis: {
+          uri: config.get<string>('REDIS_URL') || 'redis://localhost:6379',
+        },
+      }),
     }),
     EventEmitterModule.forRoot(),
     ScheduleModule.forRoot(),
@@ -187,7 +189,6 @@ const envValidationSchema = Joi.object({
         };
       },
     }),
-    ScheduleModule.forRoot(),
     AuthModule,
     CacheModule,
     HealthModule,
@@ -218,6 +219,7 @@ const envValidationSchema = Joi.object({
     CircuitBreakerModule,
     PostmanModule,
     PerformanceModule,
+    JobsModule,
     CommonModule,
     ThrottlerModule.forRoot([
       {
@@ -263,7 +265,7 @@ const envValidationSchema = Joi.object({
     },
   ],
 })
-export class AppModule {
+export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(CorrelationIdMiddleware).forRoutes('*');
   }
