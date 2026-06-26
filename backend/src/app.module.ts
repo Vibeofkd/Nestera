@@ -57,8 +57,6 @@ import { SandboxModule } from './modules/sandbox/sandbox.module';
 import { FeedbackModule } from './modules/feedback/feedback.module';
 import { StatisticsModule } from './modules/statistics/statistics.module';
 import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
-import { StatisticsModule } from './modules/statistics/statistics.module';
-import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
 
 const envValidationSchema = Joi.object({
   NODE_ENV: Joi.string().valid('development', 'production', 'test').required(),
@@ -206,15 +204,6 @@ const envValidationSchema = Joi.object({
         };
       },
     }),
-    BullModule.forRootAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        redis: {
-          uri: config.get<string>('REDIS_URL') || 'redis://localhost:6379',
-        },
-      }),
-    }),
     ConfigModule.forRoot({
       isGlobal: true,
       load: [configuration],
@@ -262,9 +251,7 @@ const envValidationSchema = Joi.object({
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        redis: {
-          uri: config.get<string>('REDIS_URL') || 'redis://localhost:6379',
-        },
+        redis: config.get<string>('REDIS_URL') || 'redis://localhost:6379',
       }),
     }),
     EventEmitterModule.forRoot(),
