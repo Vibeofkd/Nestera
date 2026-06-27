@@ -19,6 +19,10 @@ import { ProposalListItemDto } from './dto/proposal-list-item.dto';
 import { ProposalResponseDto } from './dto/proposal-response.dto';
 import { ProposalVotesResponseDto } from './dto/proposal-votes-response.dto';
 import {
+  getProposalTemplate as getProposalTemplateDefinition,
+  listProposalTemplates,
+} from './proposal-templates';
+import {
   GovernanceProposal,
   ProposalActionPayload,
   ProposalCategory,
@@ -71,7 +75,46 @@ export class GovernanceService {
       );
     }
 
-    const normalizedAction = this.validateProposalAction(dto.type, dto.action);
+    const template = dto.templateId
+      ? getProposalTemplateDefinition(dto.templateId, dto.templateVersion)
+      : null;
+
+    if (dto.templateId && !template) {
+      throw new BadRequestException(
+        `Unknown proposal template '${dto.templateId}'`,
+      );
+    }
+
+    if (template && dto.type && dto.type !== template.type) {
+      throw new BadRequestException(
+        `Template ${template.id} requires proposal type ${template.type}`,
+      );
+    }
+
+    const type = template?.type ?? dto.type;
+    if (!type) {
+      throw new BadRequestException(
+        'Proposal type is required unless a valid template is selected',
+      );
+    }
+
+    if (template && dto.action) {
+      throw new BadRequestException(
+        'Action payload must not be provided when using a proposal template. Use templateParameters instead.',
+      );
+    }
+
+    const action = template
+      ? template.actionFactory(dto.templateParameters ?? {})
+      : dto.action;
+
+    if (!action) {
+      throw new BadRequestException(
+        'Proposal action is required when not using a template',
+      );
+    }
+
+    const normalizedAction = this.validateProposalAction(type, action);
     const currentLedger = await this.getCurrentLedger();
     const startBlock =
       dto.startBlock ?? currentLedger + this.getStartDelayLedgers();
@@ -83,7 +126,7 @@ export class GovernanceService {
       order: { onChainId: 'DESC' },
     });
     const onChainId = (latestProposal?.onChainId ?? 0) + 1;
-    const category = this.mapTypeToCategory(dto.type);
+    const category = this.mapTypeToCategory(type);
     const title = this.resolveProposalTitle(
       dto.description,
       dto.title,
@@ -96,7 +139,10 @@ export class GovernanceService {
       title,
       description: dto.description,
       category,
-      type: dto.type,
+      type,
+      templateId: template?.id ?? null,
+      templateVersion: template?.version ?? null,
+      templateParameters: template ? (dto.templateParameters ?? {}) : null,
       action: normalizedAction,
       attachments: dto.attachments ?? [],
       proposer: user.publicKey,
@@ -274,6 +320,18 @@ export class GovernanceService {
     });
   }
 
+  getProposalTemplates() {
+    return listProposalTemplates();
+  }
+
+  getProposalTemplateById(templateId: string, version?: string) {
+    const template = getProposalTemplateDefinition(templateId, version);
+    if (!template) {
+      throw new NotFoundException(`Template '${templateId}' not found`);
+    }
+    return template;
+  }
+
   async getUserDelegation(userId: string): Promise<DelegationResponseDto> {
     const user = await this.userService.findById(userId);
     if (!user.publicKey) {
@@ -379,29 +437,48 @@ export class GovernanceService {
 
   // ── Lifecycle (#541) ───────────────────────────────────────────────────────
 
-  async getProposalStatus(proposalId: string): Promise<{ status: ProposalStatus; timelockEndsAt: Date | null; executedAt: Date | null }> {
+  async getProposalStatus(proposalId: string): Promise<{
+    status: ProposalStatus;
+    timelockEndsAt: Date | null;
+    executedAt: Date | null;
+  }> {
     const proposal = await this.proposalRepo.findOneBy({ id: proposalId });
-    if (!proposal) throw new NotFoundException(`Proposal ${proposalId} not found`);
-    return { status: proposal.status, timelockEndsAt: proposal.timelockEndsAt ?? null, executedAt: proposal.executedAt ?? null };
+    if (!proposal)
+      throw new NotFoundException(`Proposal ${proposalId} not found`);
+    return {
+      status: proposal.status,
+      timelockEndsAt: proposal.timelockEndsAt ?? null,
+      executedAt: proposal.executedAt ?? null,
+    };
   }
 
-  async queueProposal(proposalId: string, userId: string): Promise<ProposalResponseDto> {
+  async queueProposal(
+    proposalId: string,
+    userId: string,
+  ): Promise<ProposalResponseDto> {
     const proposal = await this.proposalRepo.findOneBy({ id: proposalId });
-    if (!proposal) throw new NotFoundException(`Proposal ${proposalId} not found`);
+    if (!proposal)
+      throw new NotFoundException(`Proposal ${proposalId} not found`);
     if (proposal.status !== ProposalStatus.PASSED) {
       throw new BadRequestException('Only passed proposals can be queued');
     }
     proposal.status = ProposalStatus.QUEUED;
     proposal.timelockEndsAt = new Date(Date.now() + TIMELOCK_DURATION_MS);
     const saved = await this.proposalRepo.save(proposal);
-    this.eventEmitter.emit('governance.proposal.queued', { proposalId: saved.id });
+    this.eventEmitter.emit('governance.proposal.queued', {
+      proposalId: saved.id,
+    });
     const currentLedger = await this.getCurrentLedger();
     return this.toProposalResponse(saved, currentLedger);
   }
 
-  async executeProposal(proposalId: string, userId: string): Promise<ProposalResponseDto> {
+  async executeProposal(
+    proposalId: string,
+    userId: string,
+  ): Promise<ProposalResponseDto> {
     const proposal = await this.proposalRepo.findOneBy({ id: proposalId });
-    if (!proposal) throw new NotFoundException(`Proposal ${proposalId} not found`);
+    if (!proposal)
+      throw new NotFoundException(`Proposal ${proposalId} not found`);
     if (proposal.status !== ProposalStatus.QUEUED) {
       throw new BadRequestException('Only queued proposals can be executed');
     }
@@ -411,38 +488,58 @@ export class GovernanceService {
     proposal.status = ProposalStatus.EXECUTED;
     proposal.executedAt = new Date();
     const saved = await this.proposalRepo.save(proposal);
-    this.eventEmitter.emit('governance.proposal.executed', { proposalId: saved.id });
+    this.eventEmitter.emit('governance.proposal.executed', {
+      proposalId: saved.id,
+    });
     const currentLedger = await this.getCurrentLedger();
     return this.toProposalResponse(saved, currentLedger);
   }
 
-  async cancelProposal(proposalId: string, userId: string): Promise<ProposalResponseDto> {
+  async cancelProposal(
+    proposalId: string,
+    userId: string,
+  ): Promise<ProposalResponseDto> {
     const proposal = await this.proposalRepo.findOneBy({ id: proposalId });
-    if (!proposal) throw new NotFoundException(`Proposal ${proposalId} not found`);
+    if (!proposal)
+      throw new NotFoundException(`Proposal ${proposalId} not found`);
     if (proposal.createdByUserId !== userId) {
       throw new ForbiddenException('Only the proposal creator can cancel it');
     }
-    if (proposal.status === ProposalStatus.EXECUTED || proposal.status === ProposalStatus.CANCELLED) {
-      throw new BadRequestException(`Cannot cancel a proposal with status ${proposal.status}`);
+    if (
+      proposal.status === ProposalStatus.EXECUTED ||
+      proposal.status === ProposalStatus.CANCELLED
+    ) {
+      throw new BadRequestException(
+        `Cannot cancel a proposal with status ${proposal.status}`,
+      );
     }
     proposal.status = ProposalStatus.CANCELLED;
     const saved = await this.proposalRepo.save(proposal);
-    this.eventEmitter.emit('governance.proposal.cancelled', { proposalId: saved.id });
+    this.eventEmitter.emit('governance.proposal.cancelled', {
+      proposalId: saved.id,
+    });
     const currentLedger = await this.getCurrentLedger();
     return this.toProposalResponse(saved, currentLedger);
   }
 
   // ── Delegation (#542) ──────────────────────────────────────────────────────
 
-  async delegate(userId: string, delegateAddress: string): Promise<{ transactionHash: string }> {
+  async delegate(
+    userId: string,
+    delegateAddress: string,
+  ): Promise<{ transactionHash: string }> {
     const user = await this.userService.findById(userId);
-    if (!user.publicKey) throw new BadRequestException('User must have a public key to delegate');
+    if (!user.publicKey)
+      throw new BadRequestException('User must have a public key to delegate');
     if (user.publicKey === delegateAddress) {
       throw new BadRequestException('Cannot delegate to yourself');
     }
     // Loop prevention: check if delegateAddress already delegates to user
     const reverseLoop = await this.delegationRepo.findOne({
-      where: { delegatorAddress: delegateAddress, delegateAddress: user.publicKey },
+      where: {
+        delegatorAddress: delegateAddress,
+        delegateAddress: user.publicKey,
+      },
     });
     if (reverseLoop) throw new BadRequestException('Delegation loop detected');
 
@@ -451,31 +548,50 @@ export class GovernanceService {
       ['delegatorAddress'],
     );
     const txHash = `0x${Math.random().toString(16).slice(2, 10)}${Date.now().toString(16)}`;
-    this.eventEmitter.emit('governance.delegation.changed', { delegator: user.publicKey, delegate: delegateAddress });
+    this.eventEmitter.emit('governance.delegation.changed', {
+      delegator: user.publicKey,
+      delegate: delegateAddress,
+    });
     return { transactionHash: txHash };
   }
 
   async revokeDelegate(userId: string): Promise<void> {
     const user = await this.userService.findById(userId);
-    if (!user.publicKey) throw new BadRequestException('User must have a public key');
+    if (!user.publicKey)
+      throw new BadRequestException('User must have a public key');
     await this.delegationRepo.delete({ delegatorAddress: user.publicKey });
-    this.eventEmitter.emit('governance.delegation.revoked', { delegator: user.publicKey });
+    this.eventEmitter.emit('governance.delegation.revoked', {
+      delegator: user.publicKey,
+    });
   }
 
-  async getMyDelegation(userId: string): Promise<{ delegate: string | null; totalDelegatedPower: number }> {
+  async getMyDelegation(
+    userId: string,
+  ): Promise<{ delegate: string | null; totalDelegatedPower: number }> {
     const user = await this.userService.findById(userId);
     if (!user.publicKey) return { delegate: null, totalDelegatedPower: 0 };
-    const record = await this.delegationRepo.findOne({ where: { delegatorAddress: user.publicKey } });
-    const delegators = await this.delegationRepo.find({ where: { delegateAddress: user.publicKey } });
+    const record = await this.delegationRepo.findOne({
+      where: { delegatorAddress: user.publicKey },
+    });
+    const delegators = await this.delegationRepo.find({
+      where: { delegateAddress: user.publicKey },
+    });
     const totalDelegatedPower = delegators.length; // simplified; real impl sums NST balances
     return { delegate: record?.delegateAddress ?? null, totalDelegatedPower };
   }
 
-  async getMyDelegators(userId: string): Promise<{ delegators: string[]; totalDelegatedPower: number }> {
+  async getMyDelegators(
+    userId: string,
+  ): Promise<{ delegators: string[]; totalDelegatedPower: number }> {
     const user = await this.userService.findById(userId);
     if (!user.publicKey) return { delegators: [], totalDelegatedPower: 0 };
-    const records = await this.delegationRepo.find({ where: { delegateAddress: user.publicKey } });
-    return { delegators: records.map((r) => r.delegatorAddress), totalDelegatedPower: records.length };
+    const records = await this.delegationRepo.find({
+      where: { delegateAddress: user.publicKey },
+    });
+    return {
+      delegators: records.map((r) => r.delegatorAddress),
+      totalDelegatedPower: records.length,
+    };
   }
 
   async getProposalVotesByOnChainId(
@@ -550,7 +666,6 @@ export class GovernanceService {
       governanceTokenContractId,
       user.publicKey,
     );
-
     return Number(balance) / 10_000_000;
   }
 
@@ -710,6 +825,9 @@ export class GovernanceService {
       description: proposal.description,
       category: proposal.category,
       type: proposal.type,
+      templateId: proposal.templateId ?? null,
+      templateVersion: proposal.templateVersion ?? null,
+      templateParameters: proposal.templateParameters ?? null,
       action: proposal.action,
       status: proposal.status,
       proposer: proposal.proposer ?? null,
