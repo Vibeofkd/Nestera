@@ -1,6 +1,6 @@
-import { Process, Processor } from '@nestjs/bull';
-import { Logger } from '@nestjs/common';
+import { Processor, Process } from '@nestjs/bull';
 import { Job } from 'bull';
+import { Logger } from '@nestjs/common';
 import { FeeRewardReconciliationService } from '../services/fee-reward-reconciliation.service';
 
 @Processor('reconciliation')
@@ -11,22 +11,15 @@ export class ReconciliationProcessor {
     private readonly reconciliationService: FeeRewardReconciliationService,
   ) {}
 
-  /**
-   * Process the reconciliation job.
-   * This job can be triggered on a schedule (e.g., via cron or external scheduler).
-   */
-  @Process('reconcile')
+  @Process('fee-reward-reconciliation')
   async handleReconciliation(job: Job) {
-    this.logger.log(`Processing reconciliation job ${job.id}`);
+    this.logger.log(`Processing reconciliation job: ${job.id}`);
     try {
-      const result = await this.reconciliationService.performReconciliation();
-      this.logger.log(
-        `Reconciliation completed: ${result.totalDifferences} discrepancies found, ${result.automaticallyCorrected} auto-corrected, ${result.adminTicketsCreated} admin tickets created.`,
-      );
-      return result;
+      const result = await this.reconciliationService.reconcile();
+      this.logger.log(`Job ${job.id} completed: ${JSON.stringify(result)}`);
     } catch (error) {
-      this.logger.error('Reconciliation job failed', error);
-      throw error;
+      this.logger.error(`Reconciliation job ${job.id} failed: ${error.message}`, error.stack);
+      throw error; // Let Bull handle retries
     }
   }
 }
