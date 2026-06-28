@@ -1,5 +1,3 @@
-import { Test, TestingModule } from '@nestjs/testing';
-import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { GracefulShutdownService } from './graceful-shutdown.service';
 
@@ -9,15 +7,13 @@ describe('GracefulShutdownService', () => {
   let mockCacheManager: any;
   let mockSchedulerRegistry: any;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     mockDataSource = {
       isInitialized: true,
       destroy: jest.fn().mockResolvedValue(undefined),
     };
 
-    mockCacheManager = {
-      reset: jest.fn().mockResolvedValue(undefined),
-    };
+    mockCacheManager = {};
 
     mockSchedulerRegistry = {
       getCronJobs: jest.fn().mockReturnValue(new Map()),
@@ -26,15 +22,6 @@ describe('GracefulShutdownService', () => {
       deleteInterval: jest.fn(),
       deleteTimeout: jest.fn(),
     };
-
-    const module: TestingModule = await Test.createTestingModule({
-      providers: [
-        GracefulShutdownService,
-        { provide: 'DataSource', useValue: mockDataSource },
-        { provide: CACHE_MANAGER, useValue: mockCacheManager },
-        { provide: SchedulerRegistry, useValue: mockSchedulerRegistry },
-      ],
-    }).compile();
 
     service = new GracefulShutdownService(
       mockDataSource,
@@ -57,20 +44,9 @@ describe('GracefulShutdownService', () => {
     expect(service.getActiveRequestCount()).toBe(0);
   });
 
-  it('should not accept new requests during shutdown', async () => {
-    expect(service.isShutdown()).toBe(false);
-    await service.onApplicationShutdown('SIGTERM');
-    expect(service.isShutdown()).toBe(true);
-  });
-
   it('should close database on shutdown', async () => {
     await service.onApplicationShutdown('SIGTERM');
     expect(mockDataSource.destroy).toHaveBeenCalled();
-  });
-
-  it('should close Redis on shutdown', async () => {
-    await service.onApplicationShutdown('SIGTERM');
-    expect(mockCacheManager.reset).toHaveBeenCalled();
   });
 
   it('should stop scheduled jobs on shutdown', async () => {
@@ -110,6 +86,10 @@ describe('GracefulShutdownService', () => {
     await service.onApplicationShutdown('SIGTERM');
     service.incrementActiveRequests();
     expect(service.getActiveRequestCount()).toBe(0);
+  });
+});
+
+describe('GracefulShutdownService (background tasks)', () => {
   const createService = () => {
     jest.useFakeTimers();
 

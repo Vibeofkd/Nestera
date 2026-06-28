@@ -5,8 +5,10 @@ import {
   Dispute,
   DisputeMessage,
   DisputeStatus,
+  DisputeTimeline,
 } from './entities/dispute.entity';
 import { MedicalClaim } from '../claims/entities/medical-claim.entity';
+import { NotificationsService } from '../notifications/notifications.service';
 import { BadRequestException } from '@nestjs/common';
 
 describe('DisputesService', () => {
@@ -28,6 +30,13 @@ describe('DisputesService', () => {
     findOneBy: jest.fn(),
   };
 
+  const mockTimelineRepository = {
+    create: jest.fn(),
+    save: jest.fn(),
+  };
+
+  const mockNotificationsService = {};
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -43,6 +52,14 @@ describe('DisputesService', () => {
         {
           provide: getRepositoryToken(MedicalClaim),
           useValue: mockClaimRepository,
+        },
+        {
+          provide: getRepositoryToken(DisputeTimeline),
+          useValue: mockTimelineRepository,
+        },
+        {
+          provide: NotificationsService,
+          useValue: mockNotificationsService,
         },
       ],
     }).compile();

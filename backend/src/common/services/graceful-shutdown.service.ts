@@ -6,7 +6,6 @@ import {
   Optional,
 } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { Inject, Optional } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { Cache } from 'cache-manager';
 import type { Server } from 'node:http';
@@ -35,24 +34,8 @@ export class GracefulShutdownService implements BeforeApplicationShutdown {
   private isShuttingDown = false;
   private schedulersStopped = false;
   private activeRequests = 0;
-  private readonly maxDrainTimeout = 25000;
-  private readonly backgroundWorkers: BackgroundWorker[] = [];
-
-  constructor(
-    private dataSource: DataSource,
-    @Inject(CACHE_MANAGER) private cacheManager: Cache,
-    @Optional() private schedulerRegistry?: SchedulerRegistry,
-  ) {}
-
-  registerWorker(worker: BackgroundWorker): void {
-    this.backgroundWorkers.push(worker);
-    this.logger.log(`Registered background worker: ${worker.name}`);
-  }
-
-  incrementActiveRequests(): void {
-    if (!this.isShuttingDown) {
-      this.activeRequests++;
   private activeBackgroundTasks = 0;
+  private readonly backgroundWorkers: BackgroundWorker[] = [];
   private registeredHttpServer?: ShutdownManagedServer;
   private closeServerPromise: Promise<void> | null = null;
   private shutdownPromise: Promise<number> | null = null;
@@ -68,6 +51,11 @@ export class GracefulShutdownService implements BeforeApplicationShutdown {
     GracefulShutdownService.instance = this;
   }
 
+  registerWorker(worker: BackgroundWorker): void {
+    this.backgroundWorkers.push(worker);
+    this.logger.log(`Registered background worker: ${worker.name}`);
+  }
+
   static async runTrackedTask<T>(
     taskName: string,
     task: () => Promise<T> | T,
@@ -79,12 +67,6 @@ export class GracefulShutdownService implements BeforeApplicationShutdown {
     return GracefulShutdownService.instance.runBackgroundTask(taskName, task);
   }
 
-  decrementActiveRequests(): void {
-    this.activeRequests = Math.max(0, this.activeRequests - 1);
-  }
-
-  getActiveRequestCount(): number {
-    return this.activeRequests;
   registerHttpServer(server: Server): void {
     if (this.registeredHttpServer === server) {
       return;
@@ -111,50 +93,6 @@ export class GracefulShutdownService implements BeforeApplicationShutdown {
     return this.activeBackgroundTasks;
   }
 
-    this.logger.log('Stopping acceptance of new requests');
-
-    await this.stopScheduledJobs();
-
-    await this.waitForInFlightRequests();
-
-    await this.stopBackgroundWorkers();
-
-    await this.closeDatabase();
-
-    await this.closeRedis();
-
-    const shutdownDuration = Date.now() - shutdownStartTime;
-    this.logger.log(`Graceful shutdown completed in ${shutdownDuration}ms`);
-  }
-
-  private async stopScheduledJobs(): Promise<void> {
-    if (!this.schedulerRegistry) return;
-
-    try {
-      const cronJobs = this.schedulerRegistry.getCronJobs();
-      cronJobs.forEach((job, name) => {
-        job.stop();
-        this.logger.log(`Stopped cron job: ${name}`);
-      });
-
-      const intervals = this.schedulerRegistry.getIntervals();
-      intervals.forEach((name) => {
-        this.schedulerRegistry!.deleteInterval(name);
-        this.logger.log(`Cleared interval: ${name}`);
-      });
-
-      const timeouts = this.schedulerRegistry.getTimeouts();
-      timeouts.forEach((name) => {
-        this.schedulerRegistry!.deleteTimeout(name);
-        this.logger.log(`Cleared timeout: ${name}`);
-      });
-    } catch (error) {
-      this.logger.error('Error stopping scheduled jobs:', error);
-    }
-  }
-
-  private async waitForInFlightRequests(): Promise<void> {
-    const startTime = Date.now();
   incrementActiveRequests(): void {
     if (this.isShuttingDown) {
       return;
@@ -209,12 +147,24 @@ export class GracefulShutdownService implements BeforeApplicationShutdown {
     return this.shutdownPromise;
   }
 
+  async onApplicationShutdown(signal?: string): Promise<void> {
+    this.beginShutdown(signal);
+    this.stopSchedulers();
+    this.registeredHttpServer?.closeIdleConnections?.();
+
+    await this.waitForDrain(this.shutdownTimeoutMs - 5_000);
+    await this.stopBackgroundWorkers();
+    await this.closeCacheConnections();
+    await this.closeDatabaseConnections();
+  }
+
   async beforeApplicationShutdown(signal?: string): Promise<void> {
     this.beginShutdown(signal);
     this.stopSchedulers();
     this.registeredHttpServer?.closeIdleConnections?.();
 
     await this.waitForDrain(this.shutdownTimeoutMs - 5_000);
+    await this.stopBackgroundWorkers();
     await this.closeCacheConnections();
     await this.closeDatabaseConnections();
   }
@@ -244,7 +194,6 @@ export class GracefulShutdownService implements BeforeApplicationShutdown {
       return;
     }
 
-      if (elapsed > this.maxDrainTimeout) {
     if (this.closeServerPromise) {
       return this.closeServerPromise;
     }
@@ -376,8 +325,8 @@ export class GracefulShutdownService implements BeforeApplicationShutdown {
         `${failed.length} background worker(s) failed to stop cleanly`,
       );
     }
-      await this.delay(this.drainPollIntervalMs);
-    }
+
+    await this.delay(this.drainPollIntervalMs);
   }
 
   private async closeDatabaseConnections(): Promise<void> {
