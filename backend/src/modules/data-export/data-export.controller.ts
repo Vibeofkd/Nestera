@@ -53,14 +53,21 @@ export class DataExportController {
 
   @Get('export/download/:token')
   @ApiOperation({ summary: 'Download export ZIP by token' })
-  async download(@Param('token') token: string, @Res() res: Response) {
-    const { filePath } = await this.dataExportService.getExportFile(token);
+  async download(
+    @CurrentUser() user: { id: string },
+    @Param('token') token: string,
+    @Res() res: Response,
+  ) {
+    const { filePath } = await this.dataExportService.getExportFile(
+      token,
+      user.id,
+    );
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader(
       'Content-Disposition',
       'attachment; filename="nestera-data-export.zip"',
     );
-    res.sendFile(path.resolve(filePath));
+    res.sendFile(filePath);
   }
 
   // ─── Typed export endpoints ───────────────────────────────────────────────
