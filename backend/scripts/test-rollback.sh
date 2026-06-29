@@ -11,12 +11,12 @@ echo "Building backend..."
 pnpm --filter backend build
 
 echo "Running migrations..."
-(cd "$ROOT_DIR" && pnpm --filter backend exec -- npx typeorm migration:run) || { echo "Migration run failed"; exit 1; }
+(cd "$ROOT_DIR" && npx typeorm migration:run --dataSource src/config/typeorm.config.ts) || { echo "Migration run failed"; exit 1; }
 
 echo "Reverting migrations one-by-one (up to 50 attempts)"
 for i in $(seq 1 50); do
   echo "Revert attempt #$i"
-  if (cd "$ROOT_DIR" && pnpm --filter backend exec -- npx typeorm migration:revert); then
+  if (cd "$ROOT_DIR" && npx typeorm migration:revert --dataSource src/config/typeorm.config.ts); then
     echo "Reverted one migration"
   else
     echo "No more migrations to revert or revert failed"
