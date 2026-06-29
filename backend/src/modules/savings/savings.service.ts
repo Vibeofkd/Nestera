@@ -5,6 +5,7 @@ import {
   ConflictException,
   Logger,
   Inject,
+  Optional,
 } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { ConfigService } from '@nestjs/config';
@@ -46,12 +47,17 @@ import { User } from '../user/entities/user.entity';
 import { SavingsService as BlockchainSavingsService } from '../blockchain/savings.service';
 import { PredictiveEvaluatorService } from './services/predictive-evaluator.service';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import { Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { SavingsProductVersionAudit } from './entities/savings-product-version-audit.entity';
 import { WaitlistService } from './waitlist.service';
 import { MilestoneService } from './services/milestone.service';
+import { AuditLogService } from '../../common/services/audit-log.service';
+import {
+  AuditAction,
+  AuditResourceType,
+} from '../../common/entities/audit-log.entity';
+import { TransactionStateMachineService } from '../transactions/transaction-state-machine.service';
 
 export type SavingsGoalProgress = GoalProgressDto;
 
@@ -119,14 +125,14 @@ export class SavingsService {
     private readonly productVersionAuditRepository: Repository<SavingsProductVersionAudit>,
     @InjectRepository(WithdrawalRequest)
     private readonly withdrawalRepository: Repository<WithdrawalRequest>,
-    @InjectRepository(Transaction)
-    private readonly transactionRepository: Repository<Transaction>,
+    private readonly transactionStateMachine: TransactionStateMachineService,
     private readonly blockchainSavingsService: BlockchainSavingsService,
     private readonly predictiveEvaluatorService: PredictiveEvaluatorService,
     private readonly milestoneService: MilestoneService,
     private readonly waitlistService: WaitlistService,
     private readonly configService: ConfigService,
     @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
+    private readonly auditLogService: AuditLogService,
     @Optional() private readonly eventEmitter?: EventEmitter2,
   ) {}
 
@@ -316,7 +322,7 @@ export class SavingsService {
    */
   async compareProducts(
     productIds: string[],
-    amount: number,
+    amount?: number,
     duration?: number,
   ): Promise<ProductComparisonResponseDto> {
     const cacheKey = `compare:${[...productIds].sort().join(',')}:${amount ?? ''}:${duration ?? ''}`;
@@ -339,53 +345,26 @@ export class SavingsService {
       );
     }
 
-    const items: ProductComparisonItemDto[] = products.map((product) => {
-      const apy = Number(product.interestRate);
-      const productDuration = duration ?? product.tenureMonths ?? 12;
-
-      const projectedEarnings = this.calculateProjectedEarnings(
-        amount,
-        apy,
-        productDuration,
-      );
-
-      return {
-        id: product.id,
-        name: product.name,
-        type: product.type,
-        description: product.description,
-        apy,
-        tenure: product.tenureMonths,
-        riskLevel: deriveRiskLevel(product.type),
-        minAmount: Number(product.minAmount),
-        maxAmount: Number(product.maxAmount),
-        isActive: product.isActive,
-        contractId: product.contractId,
-        historicalPerformance: buildHistoricalPerformance(apy),
-        projectedEarnings,
-      };
-    });
-
-    // Recommendation logic: Highest projected return, considering risk level as tie-breaker
-    const recommendedProduct = [...items].sort((a, b) => {
-      // Primary: Projected Earnings (Descending)
-      if (b.projectedEarnings !== a.projectedEarnings) {
-        return b.projectedEarnings - a.projectedEarnings;
-      }
-      // Secondary: Risk Level (Ascending: low < medium < high)
-      const riskOrder = { low: 0, medium: 1, high: 2 };
-      return riskOrder[a.riskLevel] - riskOrder[b.riskLevel];
-    })[0];
+    const items: ProductComparisonItemDto[] = products.map((product) => ({
+      id: product.id,
+      name: product.name,
+      type: product.type,
+      description: product.description,
+      apy: Number(product.interestRate),
+      tenure: product.tenureMonths,
+      riskLevel: deriveRiskLevel(product.type),
+      minAmount: Number(product.minAmount),
+      maxAmount: Number(product.maxAmount),
+      isActive: product.isActive,
+      contractId: product.contractId,
+      historicalPerformance: buildHistoricalPerformance(
+        Number(product.interestRate),
+      ),
+    }));
 
     const response: ProductComparisonResponseDto = {
       products: items,
       cached: false,
-      recommendation: recommendedProduct
-        ? {
-            productId: recommendedProduct.id,
-            reason: `Based on your ${amount} XLM investment, ${recommendedProduct.name} offers the best balance of projected returns (${recommendedProduct.projectedEarnings} XLM after 1% fee) and ${recommendedProduct.riskLevel} risk over ${duration ?? recommendedProduct.tenure ?? 12} months.`,
-          }
-        : undefined,
     };
 
     await this.cacheManager.set(cacheKey, response, COMPARE_CACHE_TTL_MS);
@@ -476,6 +455,8 @@ export class SavingsService {
     productId: string,
     amount: number,
     overrideLimits = false,
+    correlationId?: string,
+    requestId?: string,
   ): Promise<UserSubscription> {
     const product = await this.findOneProduct(productId);
     await this.syncCapacityState(product);
@@ -566,6 +547,18 @@ export class SavingsService {
     // Record waitlist conversion if the user was on the waitlist
     await this.waitlistService.recordConversion(userId, product.id);
 
+    await this.auditLogService.log({
+      action: AuditAction.DEPOSIT,
+      resourceType: AuditResourceType.SAVINGS,
+      actor: userId,
+      correlationId,
+      requestId,
+      resourceId: savedSubscription.id,
+      description: `User subscribed to savings product ${product.name} with amount ${amount}`,
+      newValue: { productId, amount, subscriptionId: savedSubscription.id },
+      success: true,
+    });
+
     return savedSubscription;
   }
 
@@ -600,90 +593,41 @@ export class SavingsService {
     }
 
     const userPublicKey = user.publicKey;
+
     const defaultVaultContractId =
       this.configService.get<string>('stellar.contractId') || null;
 
-    // Group subscriptions by vault contract ID for batching
-    const subscriptionsByVault = new Map<string | null, typeof subscriptions>();
-    for (const sub of subscriptions) {
-      const vaultId =
-        this.resolveVaultContractId(sub) ?? defaultVaultContractId;
-      if (!subscriptionsByVault.has(vaultId)) {
-        subscriptionsByVault.set(vaultId, []);
-      }
-      subscriptionsByVault.get(vaultId)!.push(sub);
-    }
+    return await Promise.all(
+      subscriptions.map(async (subscription) => {
+        const fallbackAmount = Number(subscription.amount);
+        const vaultContractId =
+          this.resolveVaultContractId(subscription) ?? defaultVaultContractId;
 
-    // Batch RPC calls per vault contract ID
-    const balancesByContractAndUser = new Map<string, Map<string, number>>();
+        if (!vaultContractId) {
+          return this.mapSubscriptionWithLiveBalance(
+            subscription,
+            fallbackAmount,
+            Math.round(fallbackAmount * STROOPS_PER_XLM),
+            'cache',
+            null,
+          );
+        }
 
-    await Promise.all(
-      Array.from(subscriptionsByVault.entries()).map(
-        async ([vaultContractId, vaultSubs]) => {
-          if (!vaultContractId) {
-            return;
-          }
+        const liveBalanceStroops =
+          await this.blockchainSavingsService.getUserVaultBalance(
+            vaultContractId,
+            userPublicKey,
+          );
 
-          // Check cache first
-          const cacheKey = `vault_balance:${vaultContractId}:${userPublicKey}`;
-          const cached = await this.cacheManager.get<number>(cacheKey);
-
-          if (cached !== undefined) {
-            if (!balancesByContractAndUser.has(vaultContractId)) {
-              balancesByContractAndUser.set(vaultContractId, new Map());
-            }
-            balancesByContractAndUser
-              .get(vaultContractId)!
-              .set(userPublicKey, cached);
-            return;
-          }
-
-          // Fetch balance and cache it (TTL: 5 minutes)
-          const balance =
-            await this.blockchainSavingsService.getUserVaultBalance(
-              vaultContractId,
-              userPublicKey,
-            );
-
-          await this.cacheManager.set(cacheKey, balance, 5 * 60 * 1000);
-
-          if (!balancesByContractAndUser.has(vaultContractId)) {
-            balancesByContractAndUser.set(vaultContractId, new Map());
-          }
-          balancesByContractAndUser
-            .get(vaultContractId)!
-            .set(userPublicKey, balance);
-        },
-      ),
-    );
-
-    // Map results
-    return subscriptions.map((subscription) => {
-      const vaultContractId =
-        this.resolveVaultContractId(subscription) ?? defaultVaultContractId;
-      const fallbackAmount = Number(subscription.amount);
-
-      if (!vaultContractId) {
         return this.mapSubscriptionWithLiveBalance(
           subscription,
-          fallbackAmount,
-          Math.round(fallbackAmount * STROOPS_PER_XLM),
-          'cache',
-          null,
+          this.stroopsToDecimal(liveBalanceStroops),
+          liveBalanceStroops,
+          'rpc',
+          vaultContractId,
         );
-      }
-
-      const liveBalanceStroops =
-        balancesByContractAndUser.get(vaultContractId)?.get(userPublicKey) ?? 0;
-
-      return this.mapSubscriptionWithLiveBalance(
-        subscription,
-        this.stroopsToDecimal(liveBalanceStroops),
-        liveBalanceStroops,
-        'rpc',
-        vaultContractId,
-      );
-    });
+      }),
+    );
   }
 
   async getProductMetrics(
@@ -1088,11 +1032,69 @@ export class SavingsService {
     await this.goalRepository.remove(goal);
   }
 
+  async transferToGoal(
+    userId: string,
+    goalId: string,
+    amount: number,
+    productId?: string,
+  ): Promise<Transaction> {
+    const goal = await this.goalRepository.findOne({
+      where: { id: goalId, userId },
+    });
+    if (!goal) {
+      throw new NotFoundException(
+        `Savings goal ${goalId} not found or does not belong to user`,
+      );
+    }
+    if (goal.status !== SavingsGoalStatus.IN_PROGRESS) {
+      throw new BadRequestException('Cannot transfer to a completed goal');
+    }
+
+    let resolvedProductId = productId;
+    if (!resolvedProductId) {
+      const user = await this.userRepository.findOne({ where: { id: userId } });
+      resolvedProductId = user?.defaultSavingsProductId ?? undefined;
+    }
+    if (!resolvedProductId) {
+      throw new BadRequestException(
+        'No savings product specified and user has no default product',
+      );
+    }
+
+    await this.subscribe(userId, resolvedProductId, amount, true);
+
+    const tx = await this.transactionStateMachine.createTransaction(
+      {
+      userId,
+      type: TxType.DEPOSIT,
+      amount: String(amount),
+      poolId: resolvedProductId,
+      metadata: { goalId, goalName: goal.goalName, transferType: 'GOAL_AUTO' },
+      txHash: `goal-transfer-${goalId}-${Date.now()}`,
+      },
+      { actor: 'savings-service', reason: 'Goal transfer initiated' },
+    );
+    await this.transactionStateMachine.transitionStatus(tx.id, TxStatus.PENDING_CONFIRMATION, {
+      actor: 'savings-service',
+      reason: 'Transfer awaiting confirmation',
+    });
+    await this.transactionStateMachine.transitionStatus(tx.id, TxStatus.CONFIRMED, {
+      actor: 'savings-service',
+      reason: 'Transfer confirmed',
+    });
+    return this.transactionStateMachine.transitionStatus(tx.id, TxStatus.COMPLETED, {
+      actor: 'savings-service',
+      reason: 'Goal transfer completed',
+    });
+  }
+
   async createWithdrawalRequest(
     userId: string,
     subscriptionId: string,
     amount: number,
     reason?: string,
+    correlationId?: string,
+    requestId?: string,
   ): Promise<WithdrawalRequest> {
     const subscription = await this.subscriptionRepository.findOne({
       where: { id: subscriptionId, userId },
@@ -1139,10 +1141,24 @@ export class SavingsService {
     const saved = await this.withdrawalRepository.save(withdrawalRequest);
 
     // Process withdrawal asynchronously
-    this.processWithdrawal(saved.id).catch((error) => {
-      this.logger.error(
-        `Failed to process withdrawal ${saved.id}: ${(error as Error).message}`,
-      );
+    this.processWithdrawal(saved.id, correlationId, requestId).catch(
+      (error) => {
+        this.logger.error(
+          `Failed to process withdrawal ${saved.id}: ${(error as Error).message}`,
+        );
+      },
+    );
+
+    await this.auditLogService.log({
+      action: AuditAction.WITHDRAW,
+      resourceType: AuditResourceType.WITHDRAWAL_REQUEST,
+      actor: userId,
+      correlationId,
+      requestId,
+      resourceId: saved.id,
+      description: `User requested withdrawal of ${amount} from subscription ${subscriptionId}${reason ? `: ${reason}` : ''}`,
+      newValue: { subscriptionId, amount, penalty, netAmount, reason },
+      success: true,
     });
 
     return saved;
@@ -1171,7 +1187,11 @@ export class SavingsService {
     return Number(penalty.toFixed(7));
   }
 
-  private async processWithdrawal(withdrawalId: string): Promise<void> {
+  private async processWithdrawal(
+    withdrawalId: string,
+    correlationId?: string,
+    requestId?: string,
+  ): Promise<void> {
     const withdrawal = await this.withdrawalRepository.findOne({
       where: { id: withdrawalId },
       relations: ['subscription', 'subscription.product'],
@@ -1180,6 +1200,8 @@ export class SavingsService {
     if (!withdrawal) {
       throw new NotFoundException(`Withdrawal ${withdrawalId} not found`);
     }
+
+    let transactionId: string | null = null;
 
     try {
       // Update status to processing
@@ -1209,22 +1231,43 @@ export class SavingsService {
       }
 
       // Record in transaction ledger
-      const transaction = this.transactionRepository.create({
-        userId: withdrawal.userId,
-        type: TxType.WITHDRAW,
-        amount: String(withdrawal.netAmount),
-        status: TxStatus.COMPLETED,
-        publicKey: user?.publicKey || null,
-        metadata: {
-          withdrawalRequestId: withdrawal.id,
-          grossAmount: String(withdrawal.amount),
-          penalty: String(withdrawal.penalty),
-          netAmount: String(withdrawal.netAmount),
-          subscriptionId: withdrawal.subscriptionId,
-          reason: withdrawal.reason,
+      const transaction = await this.transactionStateMachine.createTransaction(
+        {
+          userId: withdrawal.userId,
+          type: TxType.WITHDRAW,
+          amount: String(withdrawal.netAmount),
+          publicKey: user?.publicKey || null,
+          metadata: {
+            withdrawalRequestId: withdrawal.id,
+            grossAmount: String(withdrawal.amount),
+            penalty: String(withdrawal.penalty),
+            netAmount: String(withdrawal.netAmount),
+            subscriptionId: withdrawal.subscriptionId,
+            reason: withdrawal.reason,
+          },
         },
+        {
+          actor: 'savings-service',
+          reason: 'Withdrawal ledger transaction created',
+        },
+      );
+      transactionId = transaction.id;
+      await this.transactionStateMachine.transitionStatus(
+        transaction.id,
+        TxStatus.PENDING_CONFIRMATION,
+        {
+          actor: 'savings-service',
+          reason: 'Withdrawal awaiting confirmation',
+        },
+      );
+      await this.transactionStateMachine.transitionStatus(transaction.id, TxStatus.CONFIRMED, {
+        actor: 'savings-service',
+        reason: 'Withdrawal confirmed',
       });
-      await this.transactionRepository.save(transaction);
+      await this.transactionStateMachine.transitionStatus(transaction.id, TxStatus.COMPLETED, {
+        actor: 'savings-service',
+        reason: 'Withdrawal completed',
+      });
 
       // Update subscription amount
       const newAmount =
@@ -1243,6 +1286,23 @@ export class SavingsService {
       withdrawal.completedAt = new Date();
       await this.withdrawalRepository.save(withdrawal);
 
+      await this.auditLogService.log({
+        action: AuditAction.WITHDRAW,
+        resourceType: AuditResourceType.WITHDRAWAL_REQUEST,
+        actor: withdrawal.userId,
+        correlationId,
+        requestId,
+        resourceId: withdrawal.id,
+        description: `Withdrawal ${withdrawalId} processed successfully — net ${withdrawal.netAmount}`,
+        newValue: {
+          status: WithdrawalStatus.COMPLETED,
+          txHash: transaction.txHash,
+          netAmount: withdrawal.netAmount,
+          penalty: withdrawal.penalty,
+        },
+        success: true,
+      });
+
       // Emit event for notification
       this.eventEmitter?.emit('withdrawal.completed', {
         userId: withdrawal.userId,
@@ -1253,8 +1313,41 @@ export class SavingsService {
         timestamp: new Date(),
       });
     } catch (error) {
+      if (transactionId) {
+        try {
+          await this.transactionStateMachine.transitionStatus(
+            transactionId,
+            TxStatus.FAILED,
+            {
+              actor: 'savings-service',
+              reason: 'Withdrawal processing failed',
+              metadata: {
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : 'Unknown withdrawal error',
+              },
+            },
+          );
+        } catch {
+          // If transition is not valid from current state, keep original error flow.
+        }
+      }
       withdrawal.status = WithdrawalStatus.FAILED;
       await this.withdrawalRepository.save(withdrawal);
+
+      await this.auditLogService.log({
+        action: AuditAction.WITHDRAW,
+        resourceType: AuditResourceType.WITHDRAWAL_REQUEST,
+        actor: withdrawal.userId,
+        correlationId,
+        requestId,
+        resourceId: withdrawal.id,
+        description: `Withdrawal ${withdrawalId} failed: ${(error as Error).message}`,
+        errorMessage: (error as Error).message,
+        success: false,
+      });
+
       throw error;
     }
   }
@@ -1503,31 +1596,5 @@ export class SavingsService {
     }
 
     return product;
-  }
-
-  private calculateProjectedEarnings(
-    amount: number,
-    apy: number,
-    durationMonths: number,
-  ): number {
-    const rateDecimal = apy / 100;
-    const compoundingPeriodsPerYear = 12;
-    const timeInYears = durationMonths / 12;
-
-    // A = P(1 + r/n)^(nt)
-    const projectedBalance =
-      amount *
-      Math.pow(
-        1 + rateDecimal / compoundingPeriodsPerYear,
-        compoundingPeriodsPerYear * timeInYears,
-      );
-
-    const earnings = projectedBalance - amount;
-
-    // Applying a 1% protocol fee impact as assumed in AdminAnalyticsService
-    const netEarnings = earnings * 0.99;
-
-    // Round to 7 decimals (Stellar precision)
-    return Number(netEarnings.toFixed(7));
   }
 }

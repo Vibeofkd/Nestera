@@ -6,16 +6,15 @@ import {
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, MoreThan, IsNull } from 'typeorm';
+import { Repository, IsNull } from 'typeorm';
 import { Referral, ReferralStatus } from './entities/referral.entity';
 import { ReferralCampaign } from './entities/referral-campaign.entity';
+import { ProcessedReferralEvent, ReferralEventType } from './entities/processed-referral-event.entity';
 import { User } from '../user/entities/user.entity';
-import {
-  Transaction,
-  TxType,
-} from '../transactions/entities/transaction.entity';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { randomBytes } from 'crypto';
+import { ReferralFraudDetectionService } from './referral-fraud-detection.service';
+import { ReferralFraudEvaluationContext } from './referral-fraud.types';
 
 @Injectable()
 export class ReferralsService {
@@ -26,12 +25,50 @@ export class ReferralsService {
     private referralRepository: Repository<Referral>,
     @InjectRepository(ReferralCampaign)
     private campaignRepository: Repository<ReferralCampaign>,
+    @InjectRepository(ProcessedReferralEvent)
+    private processedEventRepository: Repository<ProcessedReferralEvent>,
     @InjectRepository(User)
     private userRepository: Repository<User>,
-    @InjectRepository(Transaction)
-    private transactionRepository: Repository<Transaction>,
     private eventEmitter: EventEmitter2,
+    private readonly fraudDetectionService: ReferralFraudDetectionService,
   ) {}
+
+  /**
+   * Check if an event has already been processed
+   */
+  private async hasEventBeenProcessed(
+    eventType: ReferralEventType,
+    userId?: string,
+    referralId?: string,
+  ): Promise<boolean> {
+    const query: any = { eventType };
+    if (userId) query.userId = userId;
+    if (referralId) query.referralId = referralId;
+    const exists = await this.processedEventRepository.findOne({
+      where: query,
+    });
+    return !!exists;
+  }
+
+  /**
+   * Mark an event as processed
+   */
+  private async markEventAsProcessed(
+    eventType: ReferralEventType,
+    userId?: string,
+    referralId?: string,
+    campaignId?: string,
+    metadata?: Record<string, any>,
+  ): Promise<void> {
+    const event = this.processedEventRepository.create({
+      eventType,
+      userId: userId || null,
+      referralId: referralId || null,
+      campaignId: campaignId || null,
+      metadata: metadata || null,
+    });
+    await this.processedEventRepository.save(event);
+  }
 
   /**
    * Generate a unique referral code for a user
@@ -40,6 +77,8 @@ export class ReferralsService {
     userId: string,
     campaignId?: string,
   ): Promise<Referral> {
+    this.fraudDetectionService.enforceCreationRateLimit(userId);
+
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) {
       throw new NotFoundException('User not found');
@@ -84,7 +123,20 @@ export class ReferralsService {
   async applyReferralCode(
     referralCode: string,
     refereeId: string,
+    context: ReferralFraudEvaluationContext = {},
   ): Promise<void> {
+    // Check idempotency
+    const alreadyProcessed = await this.hasEventBeenProcessed(
+      ReferralEventType.SIGNUP,
+      refereeId,
+    );
+    if (alreadyProcessed) {
+      this.logger.log(
+        `Referral code already processed for user ${refereeId}`,
+      );
+      return;
+    }
+
     const referral = await this.referralRepository.findOne({
       where: { referralCode },
       relations: ['referrer', 'campaign'],
@@ -99,6 +151,11 @@ export class ReferralsService {
     }
 
     if (referral.referrerId === refereeId) {
+      const evaluation = await this.fraudDetectionService.evaluateReferral(
+        { ...referral, refereeId },
+        context,
+      );
+      await this.fraudDetectionService.quarantineReferral(referral, evaluation);
       throw new BadRequestException('Cannot use your own referral code');
     }
 
@@ -125,7 +182,36 @@ export class ReferralsService {
     }
 
     referral.refereeId = refereeId;
+    const fingerprint =
+      this.fraudDetectionService.buildMetadataFingerprint(context);
+    referral.metadata = {
+      ...(referral.metadata ?? {}),
+      fingerprint: fingerprint ?? undefined,
+      appliedAt: new Date().toISOString(),
+      ...context,
+    };
+
+    const evaluation = await this.fraudDetectionService.evaluateReferral(
+      referral,
+      context,
+    );
+    if (evaluation.shouldQuarantine) {
+      await this.fraudDetectionService.quarantineReferral(referral, evaluation);
+      throw new BadRequestException(
+        'Referral flagged for manual review due to suspicious activity',
+      );
+    }
+
     await this.referralRepository.save(referral);
+
+    // Mark event as processed
+    await this.markEventAsProcessed(
+      ReferralEventType.SIGNUP,
+      refereeId,
+      referral.id,
+      referral.campaignId,
+      { referralCode },
+    );
 
     this.logger.log(
       `Referral code ${referralCode} applied for user ${refereeId}`,
@@ -139,12 +225,32 @@ export class ReferralsService {
     userId: string,
     depositAmount: string,
   ): Promise<void> {
+    // Check idempotency
+    const alreadyProcessed = await this.hasEventBeenProcessed(
+      ReferralEventType.FIRST_DEPOSIT,
+      userId,
+    );
+    if (alreadyProcessed) {
+      this.logger.log(
+        `First deposit already processed for user ${userId}`,
+      );
+      return;
+    }
+
     const referral = await this.referralRepository.findOne({
       where: { refereeId: userId, status: ReferralStatus.PENDING },
       relations: ['referrer', 'campaign'],
     });
 
     if (!referral) {
+      // Mark as processed even if no referral to prevent reprocessing
+      await this.markEventAsProcessed(
+        ReferralEventType.FIRST_DEPOSIT,
+        userId,
+        null,
+        null,
+        { depositAmount },
+      );
       return; // No pending referral for this user
     }
 
@@ -156,15 +262,28 @@ export class ReferralsService {
       this.logger.log(
         `Deposit amount ${depositAmount} below minimum ${minDeposit} for referral ${referral.id}`,
       );
+      // Mark as processed even if below min
+      await this.markEventAsProcessed(
+        ReferralEventType.FIRST_DEPOSIT,
+        userId,
+        referral.id,
+        referral.campaignId,
+        { depositAmount, belowMinimum: true },
+      );
       return;
     }
 
-    // Fraud detection checks
-    const isFraudulent = await this.detectFraud(referral);
-    if (isFraudulent) {
-      referral.status = ReferralStatus.FRAUDULENT;
-      await this.referralRepository.save(referral);
-      this.logger.warn(`Fraudulent referral detected: ${referral.id}`);
+    const evaluation =
+      await this.fraudDetectionService.evaluateReferral(referral);
+    if (evaluation.shouldQuarantine) {
+      await this.fraudDetectionService.quarantineReferral(referral, evaluation);
+      await this.markEventAsProcessed(
+        ReferralEventType.FIRST_DEPOSIT,
+        userId,
+        referral.id,
+        referral.campaignId,
+        { depositAmount, quarantined: true },
+      );
       return;
     }
 
@@ -172,6 +291,15 @@ export class ReferralsService {
     referral.status = ReferralStatus.COMPLETED;
     referral.completedAt = new Date();
     await this.referralRepository.save(referral);
+
+    // Mark event as processed
+    await this.markEventAsProcessed(
+      ReferralEventType.FIRST_DEPOSIT,
+      userId,
+      referral.id,
+      referral.campaignId,
+      { depositAmount },
+    );
 
     // Emit event for reward distribution
     this.eventEmitter.emit('referral.completed', {
@@ -188,13 +316,44 @@ export class ReferralsService {
    * Distribute rewards for completed referral
    */
   async distributeRewards(referralId: string): Promise<void> {
+    // Check idempotency
+    const alreadyProcessed = await this.hasEventBeenProcessed(
+      ReferralEventType.REFERRAL_COMPLETED,
+      null,
+      referralId,
+    );
+    if (alreadyProcessed) {
+      this.logger.log(
+        `Rewards already distributed for referral ${referralId}`,
+      );
+      return;
+    }
+
     const referral = await this.referralRepository.findOne({
-      where: { id: referralId, status: ReferralStatus.COMPLETED },
+      where: { id: referralId },
       relations: ['referrer', 'referee', 'campaign'],
     });
 
     if (!referral) {
-      throw new NotFoundException('Completed referral not found');
+      throw new NotFoundException('Referral not found');
+    }
+
+    // If already rewarded, just mark processed
+    if (referral.status === ReferralStatus.REWARDED) {
+      await this.markEventAsProcessed(
+        ReferralEventType.REFERRAL_COMPLETED,
+        null,
+        referralId,
+        referral.campaignId,
+      );
+      this.logger.log(
+        `Rewards already distributed for referral ${referralId}`,
+      );
+      return;
+    }
+
+    if (referral.status !== ReferralStatus.COMPLETED) {
+      throw new BadRequestException('Referral not completed yet');
     }
 
     const campaign = referral.campaign;
@@ -214,6 +373,13 @@ export class ReferralsService {
         this.logger.warn(
           `User ${referral.referrerId} reached max rewards limit for campaign ${campaign.id}`,
         );
+        await this.markEventAsProcessed(
+          ReferralEventType.REFERRAL_COMPLETED,
+          null,
+          referralId,
+          referral.campaignId,
+          { maxRewardsReached: true },
+        );
         return;
       }
     }
@@ -226,6 +392,14 @@ export class ReferralsService {
     referral.rewardAmount = referrerReward;
     referral.rewardedAt = new Date();
     await this.referralRepository.save(referral);
+
+    // Mark event as processed
+    await this.markEventAsProcessed(
+      ReferralEventType.REFERRAL_COMPLETED,
+      null,
+      referralId,
+      referral.campaignId,
+    );
 
     // Emit events for reward transactions
     this.eventEmitter.emit('referral.reward.distribute', {
@@ -397,55 +571,6 @@ export class ReferralsService {
     const leaderboard = await this.getLeaderboard(1000);
     const entry = leaderboard.find((e) => e.userId === userId);
     return entry ? entry.rank : null;
-  }
-
-  /**
-   * Fraud detection logic
-   */
-  private async detectFraud(referral: Referral): Promise<boolean> {
-    // Check 1: Same IP address (would need IP tracking in metadata)
-    // Check 2: Rapid signups from same referrer
-    const recentReferrals = await this.referralRepository.count({
-      where: {
-        referrerId: referral.referrerId,
-        createdAt: MoreThan(new Date(Date.now() - 24 * 60 * 60 * 1000)), // Last 24 hours
-      },
-    });
-
-    if (recentReferrals > 10) {
-      this.logger.warn(
-        `Suspicious activity: ${recentReferrals} referrals in 24h`,
-      );
-      return true;
-    }
-
-    // Check 3: Referee has suspicious transaction patterns
-    if (referral.refereeId) {
-      const transactions = await this.transactionRepository.find({
-        where: { userId: referral.refereeId },
-      });
-
-      // If only one deposit and immediate withdrawal, flag as suspicious
-      const deposits = transactions.filter((t) => t.type === TxType.DEPOSIT);
-      const withdrawals = transactions.filter(
-        (t) => t.type === TxType.WITHDRAW,
-      );
-
-      if (deposits.length === 1 && withdrawals.length > 0) {
-        const timeDiff =
-          new Date(withdrawals[0].createdAt).getTime() -
-          new Date(deposits[0].createdAt).getTime();
-        if (timeDiff < 60 * 60 * 1000) {
-          // Less than 1 hour
-          this.logger.warn(
-            `Suspicious withdrawal pattern for user ${referral.refereeId}`,
-          );
-          return true;
-        }
-      }
-    }
-
-    return false;
   }
 
   /**
