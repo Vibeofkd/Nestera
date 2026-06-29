@@ -9,7 +9,7 @@ import {
 import { Observable, throwError } from 'rxjs';
 import { tap, catchError } from 'rxjs/operators';
 import { Request, Response } from 'express';
-import { randomUUID } from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
 import { Logger } from 'nestjs-pino';
 import { LogSanitizerService } from '../services/log-sanitizer.service';
 import { ApmService } from '../../modules/apm/apm.service';
@@ -43,10 +43,10 @@ export class RequestLoggingInterceptor implements NestInterceptor {
     const correlationId =
       (request as Request & { correlationId?: string }).correlationId ||
       (request.headers['x-correlation-id'] as string) ||
-      randomUUID();
+      uuidv4();
 
     const startTime = Date.now();
-    const { method, ip } = request;
+    const { method, ip, url: requestUrl } = request;
     const url = this.sanitizer?.sanitizeUrl(request.url) ?? request.url;
     const rawPath = request.path ?? request.url;
 
